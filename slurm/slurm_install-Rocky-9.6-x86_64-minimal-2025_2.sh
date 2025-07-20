@@ -51,12 +51,12 @@ confirm() {
     done
 }
 
-# 修改软件源到南京大学源
-setup_nju_repo() {
-    log_step "配置南京大学软件源"
+# 修改软件源到中国科学技术大学源
+setup_ustc_repo() {
+    log_step "配置中国科学技术大学软件源"
     
-    if [ -f "/etc/yum.repos.d/Rocky-NJU.repo" ] && [ -f "/etc/yum.repos.d/epel.repo" ]; then
-        log_info "南京大学软件源及EPEL仓库已配置，跳过"
+    if [ -f "/etc/yum.repos.d/Rocky-ustc.repo" ] && [ -f "/etc/yum.repos.d/epel.repo" ]; then
+        log_info "中国科学技术大学软件源及EPEL仓库已配置，跳过"
         return
     fi
     
@@ -69,46 +69,46 @@ setup_nju_repo() {
     # 禁用原有源
     sed -i 's/enabled=1/enabled=0/g' /etc/yum.repos.d/*.repo
     
-    # 创建南京大学源配置
-    cat > /etc/yum.repos.d/Rocky-NJU.repo << 'EOF'
+    # 创建中国科学技术大学源配置
+    cat > /etc/yum.repos.d/Rocky-ustc.repo << 'EOF'
 [baseos]
-name=Rocky Linux $releasever - BaseOS - NJU Mirror
-baseurl=https://mirrors.nju.edu.cn/rocky/$releasever/BaseOS/$basearch/os/
+name=Rocky Linux $releasever - BaseOS - ustc Mirror
+baseurl=https://mirrors.ustc.edu.cn/rocky/$releasever/BaseOS/$basearch/os/
 gpgcheck=1
 enabled=1
 countme=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
 
 [appstream]
-name=Rocky Linux $releasever - AppStream - NJU Mirror
-baseurl=https://mirrors.nju.edu.cn/rocky/$releasever/AppStream/$basearch/os/
+name=Rocky Linux $releasever - AppStream - ustc Mirror
+baseurl=https://mirrors.ustc.edu.cn/rocky/$releasever/AppStream/$basearch/os/
 gpgcheck=1
 enabled=1
 countme=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
 
 [extras]
-name=Rocky Linux $releasever - Extras - NJU Mirror
-baseurl=https://mirrors.nju.edu.cn/rocky/$releasever/extras/$basearch/os/
+name=Rocky Linux $releasever - Extras - ustc Mirror
+baseurl=https://mirrors.ustc.edu.cn/rocky/$releasever/extras/$basearch/os/
 gpgcheck=1
 enabled=1
 countme=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
 
 [crb]
-name=Rocky Linux $releasever - CRB - NJU Mirror
-baseurl=https://mirrors.nju.edu.cn/rocky/$releasever/CRB/$basearch/os/
+name=Rocky Linux $releasever - CRB - ustc Mirror
+baseurl=https://mirrors.ustc.edu.cn/rocky/$releasever/CRB/$basearch/os/
 gpgcheck=1
 enabled=1
 countme=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
 EOF
 
-    # 配置EPEL仓库（南京大学镜像）
-    cat > /etc/yum.repos.d/epel-nju.repo << 'EOF'
+    # 配置EPEL仓库（中国科学技术大学镜像）
+    cat > /etc/yum.repos.d/epel-ustc.repo << 'EOF'
 [epel]
-name=Extra Packages for Enterprise Linux $releasever - $basearch (NJU Mirror)
-baseurl=https://mirrors.nju.edu.cn/epel/$releasever/Everything/$basearch/
+name=Extra Packages for Enterprise Linux $releasever - $basearch (ustc Mirror)
+baseurl=https://mirrors.ustc.edu.cn/epel/$releasever/Everything/$basearch/
 gpgcheck=1
 enabled=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-9
@@ -117,7 +117,7 @@ EOF
     # 清理缓存并更新
     dnf clean all
     dnf makecache
-    log_info "南京大学软件源配置完成"
+    log_info "中国科学技术大学软件源配置完成"
 }
 
 # 主机名配置
@@ -195,7 +195,7 @@ install_base_packages() {
         rpm --import https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-9
         
         # 然后安装 EPEL 仓库
-        dnf install -y https://mirrors.aliyun.com/epel/epel-release-latest-9.noarch.rpm
+        dnf install -y https://mirrors.ustc.edu.cn/epel/epel-release-latest-9.noarch.rpm
     else
         log_info "epel-release 已安装，跳过"
     fi
@@ -689,7 +689,7 @@ main() {
     fi
     
     # 执行安装步骤
-    setup_nju_repo
+    setup_ustc_repo
     setup_hostname
     install_base_packages
     check_dependencies
