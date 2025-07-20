@@ -1,11 +1,13 @@
 #!/bin/bash
-
 # Rocky Linux 9.6 Slurm 24.11.5 部署脚本
 # 作者: SGHPC
-# 版本: 1.0
+# 版本: 1.2
 # 描述: 通过OpenHPC库在Rocky Linux 9.6 minimal上部署Slurm 24.11.5
+# 1.2更新：修复mariadb数据库配置逻辑以及配置时意外退出。
 
-set -e  # 遇到错误立即退出
+
+# -----------------------------------------------------------------
+#set -e  # 遇到错误立即退出
 
 # 颜色定义
 RED='\033[0;31m'
@@ -51,9 +53,14 @@ confirm() {
     done
 }
 
-# 修改软件源到南京大学源
-setup_nju_repo() {
-    log_step "配置南京大学软件源"
+# 修改软件源到中国科学技术大学源
+setup_ustc_repo() {
+    log_step "配置中国科学技术大学软件源"
+    
+    if [ -f "/etc/yum.repos.d/Rocky-ustc.repo" ] && [ -f "/etc/yum.repos.d/epel.repo" ]; then
+        log_info "中国科学技术大学软件源及EPEL仓库已配置，跳过"
+        return
+    fi
     
     # 备份原始源文件
     if [ -d "/etc/yum.repos.d" ]; then
@@ -64,45 +71,55 @@ setup_nju_repo() {
     # 禁用原有源
     sed -i 's/enabled=1/enabled=0/g' /etc/yum.repos.d/*.repo
     
-    # 创建南京大学源配置
-    cat > /etc/yum.repos.d/Rocky-NJU.repo << 'EOF'
+    # 创建中国科学技术大学源配置
+    cat > /etc/yum.repos.d/Rocky-ustc.repo << 'EOF'
 [baseos]
-name=Rocky Linux $releasever - BaseOS - NJU Mirror
-baseurl=https://mirrors.nju.edu.cn/rocky/$releasever/BaseOS/$basearch/os/
+name=Rocky Linux $releasever - BaseOS - ustc Mirror
+baseurl=https://mirrors.ustc.edu.cn/rocky/$releasever/BaseOS/$basearch/os/
 gpgcheck=1
 enabled=1
 countme=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
 
 [appstream]
-name=Rocky Linux $releasever - AppStream - NJU Mirror
-baseurl=https://mirrors.nju.edu.cn/rocky/$releasever/AppStream/$basearch/os/
+name=Rocky Linux $releasever - AppStream - ustc Mirror
+baseurl=https://mirrors.ustc.edu.cn/rocky/$releasever/AppStream/$basearch/os/
 gpgcheck=1
 enabled=1
 countme=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
 
 [extras]
-name=Rocky Linux $releasever - Extras - NJU Mirror
-baseurl=https://mirrors.nju.edu.cn/rocky/$releasever/extras/$basearch/os/
+name=Rocky Linux $releasever - Extras - ustc Mirror
+baseurl=https://mirrors.ustc.edu.cn/rocky/$releasever/extras/$basearch/os/
 gpgcheck=1
 enabled=1
 countme=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
 
 [crb]
-name=Rocky Linux $releasever - CRB - NJU Mirror
-baseurl=https://mirrors.nju.edu.cn/rocky/$releasever/CRB/$basearch/os/
+name=Rocky Linux $releasever - CRB - ustc Mirror
+baseurl=https://mirrors.ustc.edu.cn/rocky/$releasever/CRB/$basearch/os/
 gpgcheck=1
 enabled=1
 countme=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
 EOF
 
+    # 配置EPEL仓库（中国科学技术大学镜像）
+    cat > /etc/yum.repos.d/epel-ustc.repo << 'EOF'
+[epel]
+name=Extra Packages for Enterprise Linux $releasever - $basearch (ustc Mirror)
+baseurl=https://mirrors.ustc.edu.cn/epel/$releasever/Everything/$basearch/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-9
+EOF
+
     # 清理缓存并更新
     dnf clean all
     dnf makecache
-    log_info "南京大学软件源配置完成"
+    log_info "中国科学技术大学软件源配置完成"
 }
 
 # 主机名配置
@@ -155,6 +172,11 @@ setup_hostname() {
         esac
     done
     
+    if [[ "$current_hostname" == "$new_hostname" ]]; then
+        log_info "主机名已经是 $new_hostname，跳过修改"
+        return
+    fi
+    
     if confirm "确认将主机名修改为: $new_hostname?"; then
         hostnamectl set-hostname $new_hostname
         echo "127.0.0.1 $new_hostname" >> /etc/hosts
@@ -170,8 +192,20 @@ setup_hostname() {
 install_base_packages() {
     log_step "安装基础依赖包"
     
+    # 安装EPEL仓库
+    if ! dnf list installed epel-release &>/dev/null; then
+        rpm --import https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-9
+        
+        # 然后安装 EPEL 仓库
+        dnf install -y https://mirrors.ustc.edu.cn/epel/epel-release-latest-9.noarch.rpm
+    else
+        log_info "epel-release 已安装，跳过"
+    fi
+    
+    # 启用PowerTools/CRB仓库
+    dnf config-manager --set-enabled crb
+    
     packages=(
-        "epel-release"
         "wget"
         "curl"
         "vim"
@@ -195,20 +229,41 @@ install_base_packages() {
         "perl-ExtUtils-MakeMaker"
         "chrony"
         "rsyslog"
+        "libjwt"
+        "libjwt-devel"
     )
     
-    log_info "安装基础软件包..."
-    dnf install -y "${packages[@]}"
-    
-    # 启用PowerTools/CRB仓库
-    dnf config-manager --set-enabled crb
+    for pkg in "${packages[@]}"; do
+        if dnf list installed "$pkg" &>/dev/null; then
+            log_info "$pkg 已安装，跳过"
+        else
+            dnf install -y "$pkg"
+        fi
+    done
     
     log_info "基础依赖包安装完成"
+}
+
+# 检查依赖
+check_dependencies() {
+    log_step "检查依赖"
+    
+    if ! rpm -q libjwt &>/dev/null; then
+        log_error "libjwt未安装，请先安装libjwt"
+        exit 1
+    fi
+    
+    log_info "依赖检查通过"
 }
 
 # 配置OpenHPC仓库
 setup_openhpc_repo() {
     log_step "配置OpenHPC仓库"
+    
+    if [ -f "/etc/yum.repos.d/OpenHPC.repo" ]; then
+        log_info "OpenHPC仓库已配置，跳过"
+        return
+    fi
     
     # 安装OpenHPC仓库
     dnf install -y http://repos.openhpc.community/OpenHPC/3/EL_9/x86_64/ohpc-release-3-1.el9.x86_64.rpm
@@ -242,7 +297,13 @@ install_slurm_packages() {
         )
     fi
     
-    dnf install -y "${slurm_packages[@]}"
+    for pkg in "${slurm_packages[@]}"; do
+        if dnf list installed "$pkg" &>/dev/null; then
+            log_info "$pkg 已安装，跳过"
+        else
+            dnf install -y "$pkg"
+        fi
+    done
     
     log_info "Slurm软件包安装完成"
 }
@@ -259,24 +320,163 @@ setup_mariadb() {
     systemctl enable mariadb
     systemctl start mariadb
     
-    log_info "请为MariaDB root用户设置密码"
-    mysql_secure_installation
+    # 询问用户配置方式
+    echo "MariaDB数据库安全配置选项:"
+    echo "1) 使用默认安全配置 (推荐，自动设置root密码并应用安全配置)"
+    echo "2) 手动配置 (运行mysql_secure_installation)"
+    
+    while true; do
+        read -p "请选择配置方式 (1-2): " config_choice
+        case $config_choice in
+            1)
+                setup_mariadb_default
+                break
+                ;;
+            2)
+                setup_mariadb_manual
+                break
+                ;;
+            *)
+                log_error "无效选择，请输入 1 或 2"
+                ;;
+        esac
+    done
     
     # 创建Slurm数据库和用户
-    read -s -p "请输入MariaDB root密码: " mysql_root_pass
-    echo
+    create_slurm_database
     
-    read -s -p "请设置slurm数据库用户密码: " slurm_db_pass
-    echo
+    log_info "MariaDB配置完成"
+}
+
+# 默认MariaDB配置
+setup_mariadb_default() {
+    log_info "使用默认安全配置..."
     
-    mysql -u root -p"$mysql_root_pass" << EOF
-CREATE DATABASE slurm_acct_db;
-CREATE USER 'slurm'@'localhost' IDENTIFIED BY '$slurm_db_pass';
-GRANT ALL PRIVILEGES ON slurm_acct_db.* TO 'slurm'@'localhost';
+    # 设置root密码
+    while true; do
+        read -s -p "请为MariaDB root用户设置密码: " mysql_root_pass
+        echo
+        read -s -p "请再次确认密码: " mysql_root_pass_confirm
+        echo
+        
+        if [[ "$mysql_root_pass" == "$mysql_root_pass_confirm" ]]; then
+            break
+        else
+            log_error "密码不匹配，请重新输入"
+        fi
+    done
+    
+    # 应用默认安全配置
+    mysql -u root << EOF
+-- 设置root密码
+SET PASSWORD FOR 'root'@'localhost' = PASSWORD('$mysql_root_pass');
+-- 删除匿名用户
+DELETE FROM mysql.user WHERE User='';
+-- 禁止root远程登录
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+-- 删除test数据库
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+-- 重新加载权限表
 FLUSH PRIVILEGES;
 EOF
+    
+    if [[ $? -eq 0 ]]; then
+        log_info "MariaDB默认安全配置完成"
+        log_info "- 已设置root密码"
+        log_info "- 已删除匿名用户"
+        log_info "- 已禁止root远程登录"
+        log_info "- 已删除test数据库"
+        log_info "- 已重新加载权限表"
+    else
+        log_error "MariaDB默认配置失败"
+        exit 1
+    fi
+}
 
-    log_info "MariaDB配置完成"
+# 手动MariaDB配置
+setup_mariadb_manual() {
+    log_info "启动手动配置模式..."
+    log_warn "请按照提示完成MariaDB安全配置"
+    
+    mysql_secure_installation
+    
+    # 获取root密码
+    while true; do
+        read -s -p "请输入刚才设置的MariaDB root密码: " mysql_root_pass
+        echo
+        
+        # 测试密码是否正确
+        if mysql -u root -p"$mysql_root_pass" -e "SELECT 1;" &>/dev/null; then
+            log_info "密码验证成功"
+            break
+        else
+            log_error "密码验证失败，请重新输入"
+        fi
+    done
+}
+
+# 创建Slurm数据库和用户
+create_slurm_database() {
+    log_info "创建Slurm数据库和用户..."
+    
+    # 设置slurm数据库用户密码
+    while true; do
+        read -s -p "请为slurm数据库用户设置密码: " slurm_db_pass
+        echo
+        read -s -p "请再次确认密码: " slurm_db_pass_confirm
+        echo
+        
+        if [[ "$slurm_db_pass" == "$slurm_db_pass_confirm" ]]; then
+            break
+        else
+            log_error "密码不匹配，请重新输入"
+        fi
+    done
+    
+    # 检查数据库是否已存在
+    db_exists=$(mysql -u root -p"$mysql_root_pass" -e "SHOW DATABASES LIKE 'slurm_acct_db'" 2>/dev/null | grep -c "slurm_acct_db")
+    
+    # 检查用户是否已存在
+    user_exists=$(mysql -u root -p"$mysql_root_pass" -e "SELECT User FROM mysql.user WHERE User='slurm' AND Host='localhost'" 2>/dev/null | grep -c "slurm")
+    
+    if [ "$db_exists" -eq 0 ]; then
+        mysql -u root -p"$mysql_root_pass" -e "CREATE DATABASE slurm_acct_db;" 2>/dev/null
+        if [[ $? -eq 0 ]]; then
+            log_info "已创建slurm_acct_db数据库"
+        else
+            log_error "创建数据库失败"
+            exit 1
+        fi
+    else
+        log_info "slurm_acct_db数据库已存在，跳过创建"
+    fi
+    
+    if [ "$user_exists" -eq 0 ]; then
+        mysql -u root -p"$mysql_root_pass" -e "CREATE USER 'slurm'@'localhost' IDENTIFIED BY '$slurm_db_pass';" 2>/dev/null
+        if [[ $? -eq 0 ]]; then
+            log_info "已创建slurm用户"
+        else
+            log_error "创建用户失败"
+            exit 1
+        fi
+    else
+        log_info "slurm用户已存在，跳过创建"
+        # 更新现有用户的密码
+        mysql -u root -p"$mysql_root_pass" -e "SET PASSWORD FOR 'slurm'@'localhost' = PASSWORD('$slurm_db_pass');" 2>/dev/null
+        log_info "已更新slurm用户密码"
+    fi
+    
+    # 无论是否新建，都确保权限正确
+    mysql -u root -p"$mysql_root_pass" -e "GRANT ALL PRIVILEGES ON slurm_acct_db.* TO 'slurm'@'localhost';" 2>/dev/null
+    mysql -u root -p"$mysql_root_pass" -e "FLUSH PRIVILEGES;" 2>/dev/null
+    
+    if [[ $? -eq 0 ]]; then
+        log_info "数据库权限配置完成"
+    else
+        log_error "权限配置失败"
+        exit 1
+    fi
 }
 
 # 配置Slurm
@@ -287,6 +487,8 @@ configure_slurm() {
     if ! id slurm &>/dev/null; then
         useradd -r -s /bin/false -d /var/lib/slurm slurm
         log_info "已创建slurm用户"
+    else
+        log_info "slurm用户已存在，跳过"
     fi
     
     # 创建必要目录
@@ -317,8 +519,8 @@ configure_master_slurm() {
 ClusterName=cluster
 ControlMachine=master
 ControlAddr=master
-BackupController=
-BackupAddr=
+#BackupController=
+#BackupAddr=
 
 SlurmUser=slurm
 SlurmdUser=root
@@ -363,7 +565,7 @@ NodeName=slave[1-2] CPUs=4 Sockets=1 CoresPerSocket=4 ThreadsPerCore=1 RealMemor
 
 # PARTITIONS
 PartitionName=compute Nodes=slave[1-2] Default=YES MaxTime=INFINITE State=UP
-PartitionName=all Nodes=master,slave[1-2] Default=NO MaxTime=INFINITE State=UP
+#PartitionName=all Nodes=master,slave[1-2] Default=NO MaxTime=INFINITE State=UP
 EOF
 
     # 配置slurmdbd
@@ -406,13 +608,19 @@ setup_munge() {
     log_step "配置Munge认证"
     
     # 安装munge
-    dnf install -y munge munge-libs munge-devel
+    if ! dnf list installed munge &>/dev/null; then
+        dnf install -y munge munge-libs munge-devel
+    else
+        log_info "munge 已安装，跳过"
+    fi
     
     if [[ "$node_type" == "master" ]]; then
         # 主节点生成密钥
         if [ ! -f /etc/munge/munge.key ]; then
             /usr/sbin/create-munge-key -r
             log_info "已生成Munge密钥"
+        else
+            log_info "Munge密钥已存在，跳过"
         fi
         
         log_warn "请将 /etc/munge/munge.key 复制到所有计算节点的相同位置"
@@ -498,14 +706,19 @@ system_optimization() {
     systemctl start rsyslog
     
     # 设置系统限制
-    cat >> /etc/security/limits.conf << 'EOF'
+    if ! grep -q "Slurm limits" /etc/security/limits.conf; then
+        cat >> /etc/security/limits.conf << 'EOF'
 # Slurm limits
 * soft nofile 65536
 * hard nofile 65536
 * soft nproc 65536
 * hard nproc 65536
 EOF
-
+        log_info "系统限制已设置"
+    else
+        log_info "系统限制已配置，跳过"
+    fi
+    
     log_info "系统优化完成"
 }
 
@@ -600,9 +813,10 @@ main() {
     fi
     
     # 执行安装步骤
-    setup_nju_repo
+    setup_ustc_repo
     setup_hostname
     install_base_packages
+    check_dependencies
     setup_openhpc_repo
     install_slurm_packages
     setup_munge

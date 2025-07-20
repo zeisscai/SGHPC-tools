@@ -1,11 +1,13 @@
 #!/bin/bash
-
 # Rocky Linux 9.6 Slurm 24.11.5 部署脚本
 # 作者: SGHPC
-# 版本: 1.1
-# 描述: 通过OpenHPC库在Rocky Linux 9.6 minimal上部署Slurm 24.11.5，修复依赖问题并优化配置
+# 版本: 1.2
+# 描述: 通过OpenHPC库在Rocky Linux 9.6 minimal上部署Slurm 24.11.5
+# 1.2更新：修改到ustc软件源，修复mariadb数据库配置逻辑以及配置时意外退出。
 
-set -e  # 遇到错误立即退出
+
+# -----------------------------------------------------------------
+#set -e  # 遇到错误立即退出
 
 # 颜色定义
 RED='\033[0;31m'
@@ -318,41 +320,163 @@ setup_mariadb() {
     systemctl enable mariadb
     systemctl start mariadb
     
-    log_info "请为MariaDB root用户设置密码"
-    mysql_secure_installation
+    # 询问用户配置方式
+    echo "MariaDB数据库安全配置选项:"
+    echo "1) 使用默认安全配置 (推荐，自动设置root密码并应用安全配置)"
+    echo "2) 手动配置 (运行mysql_secure_installation)"
+    
+    while true; do
+        read -p "请选择配置方式 (1-2): " config_choice
+        case $config_choice in
+            1)
+                setup_mariadb_default
+                break
+                ;;
+            2)
+                setup_mariadb_manual
+                break
+                ;;
+            *)
+                log_error "无效选择，请输入 1 或 2"
+                ;;
+        esac
+    done
     
     # 创建Slurm数据库和用户
-    read -s -p "请输入MariaDB root密码: " mysql_root_pass
-    echo
+    create_slurm_database
     
-    read -s -p "请设置slurm数据库用户密码: " slurm_db_pass
-    echo
+    log_info "MariaDB配置完成"
+}
+
+# 默认MariaDB配置
+setup_mariadb_default() {
+    log_info "使用默认安全配置..."
+    
+    # 设置root密码
+    while true; do
+        read -s -p "请为MariaDB root用户设置密码: " mysql_root_pass
+        echo
+        read -s -p "请再次确认密码: " mysql_root_pass_confirm
+        echo
+        
+        if [[ "$mysql_root_pass" == "$mysql_root_pass_confirm" ]]; then
+            break
+        else
+            log_error "密码不匹配，请重新输入"
+        fi
+    done
+    
+    # 应用默认安全配置
+    mysql -u root << EOF
+-- 设置root密码
+SET PASSWORD FOR 'root'@'localhost' = PASSWORD('$mysql_root_pass');
+-- 删除匿名用户
+DELETE FROM mysql.user WHERE User='';
+-- 禁止root远程登录
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+-- 删除test数据库
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+-- 重新加载权限表
+FLUSH PRIVILEGES;
+EOF
+    
+    if [[ $? -eq 0 ]]; then
+        log_info "MariaDB默认安全配置完成"
+        log_info "- 已设置root密码"
+        log_info "- 已删除匿名用户"
+        log_info "- 已禁止root远程登录"
+        log_info "- 已删除test数据库"
+        log_info "- 已重新加载权限表"
+    else
+        log_error "MariaDB默认配置失败"
+        exit 1
+    fi
+}
+
+# 手动MariaDB配置
+setup_mariadb_manual() {
+    log_info "启动手动配置模式..."
+    log_warn "请按照提示完成MariaDB安全配置"
+    
+    mysql_secure_installation
+    
+    # 获取root密码
+    while true; do
+        read -s -p "请输入刚才设置的MariaDB root密码: " mysql_root_pass
+        echo
+        
+        # 测试密码是否正确
+        if mysql -u root -p"$mysql_root_pass" -e "SELECT 1;" &>/dev/null; then
+            log_info "密码验证成功"
+            break
+        else
+            log_error "密码验证失败，请重新输入"
+        fi
+    done
+}
+
+# 创建Slurm数据库和用户
+create_slurm_database() {
+    log_info "创建Slurm数据库和用户..."
+    
+    # 设置slurm数据库用户密码
+    while true; do
+        read -s -p "请为slurm数据库用户设置密码: " slurm_db_pass
+        echo
+        read -s -p "请再次确认密码: " slurm_db_pass_confirm
+        echo
+        
+        if [[ "$slurm_db_pass" == "$slurm_db_pass_confirm" ]]; then
+            break
+        else
+            log_error "密码不匹配，请重新输入"
+        fi
+    done
     
     # 检查数据库是否已存在
-    db_exists=$(mysql -u root -p"$mysql_root_pass" -e "SHOW DATABASES LIKE 'slurm_acct_db'" | grep -c "slurm_acct_db")
+    db_exists=$(mysql -u root -p"$mysql_root_pass" -e "SHOW DATABASES LIKE 'slurm_acct_db'" 2>/dev/null | grep -c "slurm_acct_db")
     
     # 检查用户是否已存在
-    user_exists=$(mysql -u root -p"$mysql_root_pass" -e "SELECT User FROM mysql.user WHERE User='slurm' AND Host='localhost'" | grep -c "slurm")
+    user_exists=$(mysql -u root -p"$mysql_root_pass" -e "SELECT User FROM mysql.user WHERE User='slurm' AND Host='localhost'" 2>/dev/null | grep -c "slurm")
     
     if [ "$db_exists" -eq 0 ]; then
-        mysql -u root -p"$mysql_root_pass" -e "CREATE DATABASE slurm_acct_db"
-        log_info "已创建slurm_acct_db数据库"
+        mysql -u root -p"$mysql_root_pass" -e "CREATE DATABASE slurm_acct_db;" 2>/dev/null
+        if [[ $? -eq 0 ]]; then
+            log_info "已创建slurm_acct_db数据库"
+        else
+            log_error "创建数据库失败"
+            exit 1
+        fi
     else
         log_info "slurm_acct_db数据库已存在，跳过创建"
     fi
     
     if [ "$user_exists" -eq 0 ]; then
-        mysql -u root -p"$mysql_root_pass" -e "CREATE USER 'slurm'@'localhost' IDENTIFIED BY '$slurm_db_pass'"
-        log_info "已创建slurm用户"
+        mysql -u root -p"$mysql_root_pass" -e "CREATE USER 'slurm'@'localhost' IDENTIFIED BY '$slurm_db_pass';" 2>/dev/null
+        if [[ $? -eq 0 ]]; then
+            log_info "已创建slurm用户"
+        else
+            log_error "创建用户失败"
+            exit 1
+        fi
     else
         log_info "slurm用户已存在，跳过创建"
+        # 更新现有用户的密码
+        mysql -u root -p"$mysql_root_pass" -e "SET PASSWORD FOR 'slurm'@'localhost' = PASSWORD('$slurm_db_pass');" 2>/dev/null
+        log_info "已更新slurm用户密码"
     fi
     
     # 无论是否新建，都确保权限正确
-    mysql -u root -p"$mysql_root_pass" -e "GRANT ALL PRIVILEGES ON slurm_acct_db.* TO 'slurm'@'localhost'"
-    mysql -u root -p"$mysql_root_pass" -e "FLUSH PRIVILEGES"
+    mysql -u root -p"$mysql_root_pass" -e "GRANT ALL PRIVILEGES ON slurm_acct_db.* TO 'slurm'@'localhost';" 2>/dev/null
+    mysql -u root -p"$mysql_root_pass" -e "FLUSH PRIVILEGES;" 2>/dev/null
     
-    log_info "MariaDB配置完成"
+    if [[ $? -eq 0 ]]; then
+        log_info "数据库权限配置完成"
+    else
+        log_error "权限配置失败"
+        exit 1
+    fi
 }
 
 # 配置Slurm
