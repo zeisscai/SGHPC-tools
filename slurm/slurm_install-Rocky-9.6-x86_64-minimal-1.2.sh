@@ -1,13 +1,14 @@
 #!/bin/bash
 # Rocky Linux 9.6 Slurm 24.11.5 部署脚本
 # 作者: SGHPC
-# 版本: 1.2
+# 版本: 1.3
 # 描述: 通过OpenHPC库在Rocky Linux 9.6 minimal上部署Slurm 24.11.5
-# 1.2更新：修改到ustc软件源，修复mariadb数据库配置逻辑以及配置时意外退出。
+# 1.2更新：修复mariadb数据库配置逻辑以及配置时意外退出。
+# 1.3更新：将数据库配置改为自动
 
 
 # -----------------------------------------------------------------
-#set -e  # 遇到错误立即退出
+#set -e  # 遇到错误立即退出-修改
 
 # 颜色定义
 RED='\033[0;31m'
@@ -141,16 +142,26 @@ setup_hostname() {
             1)
                 new_hostname="master"
                 node_type="master"
+                # 询问是否将master也作为计算节点
+                if confirm "是否将master节点同时作为计算节点？"; then
+                    master_as_compute="yes"
+                    log_info "master节点将同时作为计算节点"
+                else
+                    master_as_compute="no"
+                    log_info "master节点仅作为控制节点"
+                fi
                 break
                 ;;
             2)
                 new_hostname="slave1"
                 node_type="compute"
+                master_as_compute="no"
                 break
                 ;;
             3)
                 new_hostname="slave2"
                 node_type="compute"
+                master_as_compute="no"
                 break
                 ;;
             4)
@@ -160,8 +171,20 @@ setup_hostname() {
                 echo "2) 计算节点"
                 read -p "请输入选择 (1-2): " type_choice
                 case $type_choice in
-                    1) node_type="master";;
-                    2) node_type="compute";;
+                    1) 
+                        node_type="master"
+                        if confirm "是否将master节点同时作为计算节点？"; then
+                            master_as_compute="yes"
+                            log_info "master节点将同时作为计算节点"
+                        else
+                            master_as_compute="no"
+                            log_info "master节点仅作为控制节点"
+                        fi
+                        ;;
+                    2) 
+                        node_type="compute"
+                        master_as_compute="no"
+                        ;;
                     *) log_error "无效选择"; continue;;
                 esac
                 break
@@ -185,76 +208,10 @@ setup_hostname() {
     else
         log_warn "跳过主机名修改"
         node_type="master"  # 默认为master
+        master_as_compute="no"  # 默认不作为计算节点
     fi
 }
 
-# 安装基础依赖包
-install_base_packages() {
-    log_step "安装基础依赖包"
-    
-    # 安装EPEL仓库
-    if ! dnf list installed epel-release &>/dev/null; then
-        rpm --import https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-9
-        
-        # 然后安装 EPEL 仓库
-        dnf install -y https://mirrors.ustc.edu.cn/epel/epel-release-latest-9.noarch.rpm
-    else
-        log_info "epel-release 已安装，跳过"
-    fi
-    
-    # 启用PowerTools/CRB仓库
-    dnf config-manager --set-enabled crb
-    
-    packages=(
-        "wget"
-        "curl"
-        "vim"
-        "gcc"
-        "gcc-c++"
-        "make"
-        "rpm-build"
-        "which"
-        "openssl-devel"
-        "pam-devel"
-        "numactl-devel"
-        "hwloc-devel"
-        "lua-devel"
-        "readline-devel"
-        "rrdtool-devel"
-        "ncurses-devel"
-        "gtk2-devel"
-        "libibmad"
-        "libibumad"
-        "perl-Switch"
-        "perl-ExtUtils-MakeMaker"
-        "chrony"
-        "rsyslog"
-        "libjwt"
-        "libjwt-devel"
-    )
-    
-    for pkg in "${packages[@]}"; do
-        if dnf list installed "$pkg" &>/dev/null; then
-            log_info "$pkg 已安装，跳过"
-        else
-            dnf install -y "$pkg"
-        fi
-    done
-    
-    log_info "基础依赖包安装完成"
-}
-
-# 检查依赖
-check_dependencies() {
-    log_step "检查依赖"
-    
-    if ! rpm -q libjwt &>/dev/null; then
-        log_error "libjwt未安装，请先安装libjwt"
-        exit 1
-    fi
-    
-    log_info "依赖检查通过"
-}
 
 # 配置OpenHPC仓库
 setup_openhpc_repo() {
@@ -276,18 +233,32 @@ install_slurm_packages() {
     log_step "安装Slurm相关软件包"
     
     if [[ "$node_type" == "master" ]]; then
-        log_info "安装主节点Slurm包..."
-        slurm_packages=(
-            "ohpc-slurm-server"
-            "slurm-ohpc"
-            "slurm-devel-ohpc"
-            "slurm-example-configs-ohpc"
-            "slurm-slurmctld-ohpc"
-            "slurm-slurmd-ohpc"
-            "slurm-slurmdbd-ohpc"
-            "mariadb-server"
-            "mariadb"
-        )
+        if [[ "$master_as_compute" == "yes" ]]; then
+            log_info "安装主节点+计算节点Slurm包..."
+            slurm_packages=(
+                "ohpc-slurm-server"
+                "slurm-ohpc"
+                "slurm-devel-ohpc"
+                "slurm-example-configs-ohpc"
+                "slurm-slurmctld-ohpc"
+                "slurm-slurmd-ohpc"
+                "slurm-slurmdbd-ohpc"
+                "mariadb-server"
+                "mariadb"
+            )
+        else
+            log_info "安装主节点Slurm包（仅控制节点）..."
+            slurm_packages=(
+                "ohpc-slurm-server"
+                "slurm-ohpc"
+                "slurm-devel-ohpc"
+                "slurm-example-configs-ohpc"
+                "slurm-slurmctld-ohpc"
+                "slurm-slurmdbd-ohpc"
+                "mariadb-server"
+                "mariadb"
+            )
+        fi
     else
         log_info "安装计算节点Slurm包..."
         slurm_packages=(
@@ -308,7 +279,32 @@ install_slurm_packages() {
     log_info "Slurm软件包安装完成"
 }
 
-# 配置MariaDB (仅主节点)
+# 生成随机密码函数
+generate_random_password() {
+    local length=${1:-16}
+    # 生成包含大小写字母、数字和特殊字符的随机密码
+    openssl rand -base64 32 | tr -d "=+/" | cut -c1-${length}
+}
+
+# 保存密码到文件
+save_passwords_to_file() {
+    local script_dir=$(dirname "$(readlink -f "$0")")
+    local password_file="${script_dir}/slurm_passwords.txt"
+    
+    cat > "$password_file" << EOF
+# Slurm数据库密码文件
+# 生成时间: $(date)
+# 主机名: $(hostname)
+
+MYSQL_ROOT_PASSWORD=${mysql_root_pass}
+SLURM_DB_PASSWORD=${slurm_db_pass}
+EOF
+
+    chmod 600 "$password_file"
+    log_info "密码已保存到文件: $password_file"
+}
+
+# 配置MariaDB (仅主节点) - 修改版
 setup_mariadb() {
     if [[ "$node_type" != "master" ]]; then
         return 0
@@ -320,56 +316,33 @@ setup_mariadb() {
     systemctl enable mariadb
     systemctl start mariadb
     
-    # 询问用户配置方式
-    echo "MariaDB数据库安全配置选项:"
-    echo "1) 使用默认安全配置 (推荐，自动设置root密码并应用安全配置)"
-    echo "2) 手动配置 (运行mysql_secure_installation)"
+    # 自动生成密码
+    mysql_root_pass=$(generate_random_password 20)
+    slurm_db_pass=$(generate_random_password 20)
     
-    while true; do
-        read -p "请选择配置方式 (1-2): " config_choice
-        case $config_choice in
-            1)
-                setup_mariadb_default
-                break
-                ;;
-            2)
-                setup_mariadb_manual
-                break
-                ;;
-            *)
-                log_error "无效选择，请输入 1 或 2"
-                ;;
-        esac
-    done
+    log_info "已生成MariaDB root密码: $mysql_root_pass"
+    log_info "已生成Slurm数据库用户密码: $slurm_db_pass"
+    
+    # 应用默认安全配置
+    setup_mariadb_default
     
     # 创建Slurm数据库和用户
     create_slurm_database
     
+    # 保存密码到文件
+    save_passwords_to_file
+    
     log_info "MariaDB配置完成"
 }
 
-# 默认MariaDB配置
+# 默认MariaDB配置 - 修改版
 setup_mariadb_default() {
-    log_info "使用默认安全配置..."
-    
-    # 设置root密码
-    while true; do
-        read -s -p "请为MariaDB root用户设置密码: " mysql_root_pass
-        echo
-        read -s -p "请再次确认密码: " mysql_root_pass_confirm
-        echo
-        
-        if [[ "$mysql_root_pass" == "$mysql_root_pass_confirm" ]]; then
-            break
-        else
-            log_error "密码不匹配，请重新输入"
-        fi
-    done
+    log_info "使用自动生成的安全配置..."
     
     # 应用默认安全配置
     mysql -u root << EOF
 -- 设置root密码
-SET PASSWORD FOR 'root'@'localhost' = PASSWORD('$mysql_root_pass');
+ALTER USER 'root'@'localhost' IDENTIFIED BY '$mysql_root_pass';
 -- 删除匿名用户
 DELETE FROM mysql.user WHERE User='';
 -- 禁止root远程登录
@@ -394,45 +367,9 @@ EOF
     fi
 }
 
-# 手动MariaDB配置
-setup_mariadb_manual() {
-    log_info "启动手动配置模式..."
-    log_warn "请按照提示完成MariaDB安全配置"
-    
-    mysql_secure_installation
-    
-    # 获取root密码
-    while true; do
-        read -s -p "请输入刚才设置的MariaDB root密码: " mysql_root_pass
-        echo
-        
-        # 测试密码是否正确
-        if mysql -u root -p"$mysql_root_pass" -e "SELECT 1;" &>/dev/null; then
-            log_info "密码验证成功"
-            break
-        else
-            log_error "密码验证失败，请重新输入"
-        fi
-    done
-}
-
-# 创建Slurm数据库和用户
+# 创建Slurm数据库和用户 - 修改版
 create_slurm_database() {
     log_info "创建Slurm数据库和用户..."
-    
-    # 设置slurm数据库用户密码
-    while true; do
-        read -s -p "请为slurm数据库用户设置密码: " slurm_db_pass
-        echo
-        read -s -p "请再次确认密码: " slurm_db_pass_confirm
-        echo
-        
-        if [[ "$slurm_db_pass" == "$slurm_db_pass_confirm" ]]; then
-            break
-        else
-            log_error "密码不匹配，请重新输入"
-        fi
-    done
     
     # 检查数据库是否已存在
     db_exists=$(mysql -u root -p"$mysql_root_pass" -e "SHOW DATABASES LIKE 'slurm_acct_db'" 2>/dev/null | grep -c "slurm_acct_db")
@@ -513,8 +450,10 @@ configure_slurm() {
 configure_master_slurm() {
     log_info "配置主节点Slurm..."
     
-    # 生成Slurm配置文件
-    cat > /etc/slurm/slurm.conf << 'EOF'
+    # 根据master是否作为计算节点生成不同的配置
+    if [[ "$master_as_compute" == "yes" ]]; then
+        # master作为计算节点的配置
+        cat > /etc/slurm/slurm.conf << 'EOF'
 # slurm.conf file generated by configurator.html.
 ClusterName=cluster
 ControlMachine=master
@@ -564,9 +503,62 @@ NodeName=master CPUs=4 Sockets=1 CoresPerSocket=4 ThreadsPerCore=1 RealMemory=40
 NodeName=slave[1-2] CPUs=4 Sockets=1 CoresPerSocket=4 ThreadsPerCore=1 RealMemory=4000 State=UNKNOWN
 
 # PARTITIONS
-PartitionName=compute Nodes=slave[1-2] Default=YES MaxTime=INFINITE State=UP
-#PartitionName=all Nodes=master,slave[1-2] Default=NO MaxTime=INFINITE State=UP
+PartitionName=compute Nodes=master,slave[1-2] Default=YES MaxTime=INFINITE State=UP
 EOF
+    else
+        # master仅作为控制节点的配置
+        cat > /etc/slurm/slurm.conf << 'EOF'
+# slurm.conf file generated by configurator.html.
+ClusterName=cluster
+ControlMachine=master
+ControlAddr=master
+#BackupController=
+#BackupAddr=
+
+SlurmUser=slurm
+SlurmdUser=root
+SlurmctldPort=6817
+SlurmdPort=6818
+AuthType=auth/munge
+StateSaveLocation=/var/spool/slurm/ctld
+SlurmdSpoolDir=/var/spool/slurm/d
+SwitchType=switch/none
+MpiDefault=none
+SlurmctldPidFile=/var/run/slurm/slurmctld.pid
+SlurmdPidFile=/var/run/slurm/slurmd.pid
+ProctrackType=proctrack/pgid
+ReturnToService=1
+SlurmctldTimeout=120
+SlurmdTimeout=300
+InactiveLimit=0
+MinJobAge=300
+KillWait=30
+MaxJobCount=10000
+Waittime=0
+
+# SCHEDULING
+SchedulerType=sched/backfill
+SelectType=select/cons_tres
+SelectTypeParameters=CR_Core
+
+# LOGGING AND ACCOUNTING
+AccountingStorageType=accounting_storage/slurmdbd
+AccountingStoreFlags=job_comment
+JobCompType=jobcomp/none
+JobAcctGatherFrequency=30
+JobAcctGatherType=jobacct_gather/linux
+SlurmctldDebug=info
+SlurmctldLogFile=/var/log/slurm/slurmctld.log
+SlurmdDebug=info
+SlurmdLogFile=/var/log/slurm/slurmd.log
+
+# NODES
+NodeName=slave[1-2] CPUs=4 Sockets=1 CoresPerSocket=4 ThreadsPerCore=1 RealMemory=4000 State=UNKNOWN
+
+# PARTITIONS
+PartitionName=compute Nodes=slave[1-2] Default=YES MaxTime=INFINITE State=UP
+EOF
+    fi
 
     # 配置slurmdbd
     cat > /etc/slurm/slurmdbd.conf << EOF
@@ -648,14 +640,19 @@ start_slurm_services() {
         # 主节点服务
         systemctl enable slurmdbd
         systemctl enable slurmctld
-        systemctl enable slurmd
         
         systemctl start slurmdbd
         sleep 5
         systemctl start slurmctld
-        systemctl start slurmd
         
-        log_info "主节点Slurm服务已启动"
+        # 根据配置决定是否启动slurmd
+        if [[ "$master_as_compute" == "yes" ]]; then
+            systemctl enable slurmd
+            systemctl start slurmd
+            log_info "主节点Slurm服务已启动（包含计算服务）"
+        else
+            log_info "主节点Slurm控制服务已启动"
+        fi
     else
         # 计算节点服务
         systemctl enable slurmd
@@ -733,9 +730,13 @@ verify_installation() {
     if [[ "$node_type" == "master" ]]; then
         systemctl status slurmdbd --no-pager -l
         systemctl status slurmctld --no-pager -l
+        
+        if [[ "$master_as_compute" == "yes" ]]; then
+            systemctl status slurmd --no-pager -l
+        fi
+    else
+        systemctl status slurmd --no-pager -l
     fi
-    
-    systemctl status slurmd --no-pager -l
     
     # 检查Slurm命令
     echo -e "\n=== Slurm版本 ==="
@@ -765,7 +766,13 @@ show_post_install_info() {
         echo "2. 将 /etc/slurm/slurm.conf 复制到所有计算节点"
         echo "3. 根据实际硬件配置修改 /etc/slurm/slurm.conf 中的节点信息"
         echo "4. 确保所有节点的主机名解析正确 (/etc/hosts)"
-        echo "5. 在所有节点安装完成后运行: scontrol update nodename=ALL state=idle"
+        if [[ "$master_as_compute" == "yes" ]]; then
+            echo "5. 在所有节点安装完成后运行: scontrol update nodename=ALL state=idle"
+            echo "   注意：master节点已配置为计算节点"
+        else
+            echo "5. 在所有节点安装完成后运行: scontrol update nodename=slave[1-2] state=idle"
+            echo "   注意：master节点仅作为控制节点，不参与计算"
+        fi
     else
         echo "计算节点后续操作:"
         echo "1. 从主节点复制 /etc/munge/munge.key"
@@ -795,14 +802,25 @@ show_post_install_info() {
     echo "  /var/log/slurm/slurmdbd.log  - 数据库日志"
 }
 
+show_logo(){
+    echo -e "${BLUE}"
+    echo "========================================================"
+    echo " ____   ____       _   _ ____   ____   _              _ "
+    echo "/ ___| / ___|     | | | |  _ \ / ___| | |_ ___   ___ | |"
+    echo "\___ \| |  _ _____| |_| | |_) | |     | __/ _ \ / _ \| |"
+    echo " ___) | |_| |_____|  _  |  __/| |___  | || (_) | (_) | |"
+    echo "|____/ \____|     |_| |_|_|    \____|  \__\___/ \___/|_|"   
+    echo "    Rocky Linux 9.6 Slurm 24.11.5 部署脚本"
+    echo "    脚本版本: 1.3"
+    echo "    安装教程: https://docs.sg-hpc.com/"
+    echo "========================================================"
+    echo -e "${NC}"
+}
+
 # 主函数
 main() {
-    echo -e "${BLUE}"
-    echo "=================================================="
-    echo "    Rocky Linux 9.6 Slurm 24.11.5 部署脚本"
-    echo "=================================================="
-    echo -e "${NC}"
     
+    show_logo
     # 检查root权限
     check_root
     
@@ -812,11 +830,12 @@ main() {
         exit 0
     fi
     
+    # 初始化变量
+    master_as_compute="no"
+    
     # 执行安装步骤
     setup_ustc_repo
     setup_hostname
-    install_base_packages
-    check_dependencies
     setup_openhpc_repo
     install_slurm_packages
     setup_munge
