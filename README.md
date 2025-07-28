@@ -38,3 +38,10 @@ SG-HPC Tool 是一个专为高性能计算（HPC）领域设计的集群管理�
     sh slurm_install-Rocky-9.6-x86_64-minimal-1.2.sh
 ```
 安装完成后需要自行复制munge.key，修改slurm.conf，修改hosts文件。
+
+## 联系我们
+如果有问题或建议，可发送邮件至
+
+<a href="mailto:contact@sg-hpc.com.cn"><img src="https://img.shields.io/badge/contact%40sg--hpc.com.cn-blue
+" alt="email"></a>
+
