@@ -9,11 +9,8 @@
 
 <p align="center">
   <a href="https://www.gnu.org/licenses/gpl-3.0.html"><img src="https://shields.io/github/license/1Panel-dev/1Panel?color=%231890FF" alt="License: GPL v3"></a>
-  <a href="https://github.com/zeisscai/SGHPC-tools"><img src="https://img.shields.io/badge/Version-1.3_beta-blue
-  " alt="GitHub release"></a>
-  <a href="https://docs.sg-hpc.com
-  "><img src="https://img.shields.io/badge/%E4%BD%BF%E7%94%A8%E6%8C%87%E5%8D%97-8A2BE2
-  " alt="SG-HPC docs"></a>
+  <a href="https://github.com/zeisscai/SGHPC-tools"><img src="https://img.shields.io/badge/Version-1.3_beta-blue" alt="GitHub release"></a>
+  <a href="https://docs.sg-hpc.com"><img src="https://img.shields.io/badge/%E4%BD%BF%E7%94%A8%E6%8C%87%E5%8D%97-8A2BE2" alt="SG-HPC docs"></a>
 </p>
 
 
