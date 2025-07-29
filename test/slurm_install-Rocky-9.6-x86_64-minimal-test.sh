@@ -1,10 +1,11 @@
 #!/bin/bash
 # Rocky Linux 9.6 Slurm 24.11.5 部署脚本
 # 作者: SGHPC
-# 版本: 1.3
+# 版本: 1.4
 # 描述: 通过OpenHPC库在Rocky Linux 9.6 minimal上部署Slurm 24.11.5
 # 1.2更新：修复mariadb数据库配置逻辑以及配置时意外退出。
 # 1.3更新：将数据库配置改为自动
+# 1.4更新：自动化配置，最多5台节点
 
 
 # -----------------------------------------------------------------
@@ -54,229 +55,305 @@ confirm() {
     done
 }
 
+# 解析配置文件
+parse_config() {
+    log_step "解析配置文件"
+    
+    local config_file="$(dirname "$(readlink -f "$0")")/deploy.conf"
+    
+    if [ ! -f "$config_file" ]; then
+        log_error "配置文件 $config_file 不存在"
+        exit 1
+    fi
+    
+    # 初始化数组
+    nodes=()
+    node_ips=()
+    node_passwords=()
+    node_hostnames=()
+    
+    # 读取配置文件
+    current_section=""
+    master_ip=""
+    master_password=""
+    master_hostname=""
+    
+    while IFS= read -r line; do
+        # 跳过空行和注释
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        
+        # 检查是否是节标题
+        if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+            current_section="${BASH_REMATCH[1]}"
+            
+            # 检查节标题是否有效
+            if [[ "$current_section" != "master" ]] && [[ ! "$current_section" =~ ^node[0-9]+$ ]]; then
+                log_error "无效的节标题: $current_section"
+                exit 1
+            fi
+            
+            # 检查节点数量
+            if [[ "$current_section" =~ ^node[0-9]+$ ]]; then
+                node_num=${current_section#node}
+                if [ "$node_num" -gt 4 ]; then
+                    log_error "节点编号不能超过4 (当前: $node_num)"
+                    exit 1
+                fi
+            fi
+            
+            # 初始化节点信息
+            declare "${current_section}_ip="
+            declare "${current_section}_password="
+            declare "${current_section}_hostname="
+        elif [[ -n "$current_section" ]] && [[ "$line" =~ ^[[:space:]]*([^=]+)[[:space:]]*=[[:space:]]*(.*)[[:space:]]*$ ]]; then
+            key="${BASH_REMATCH[1]// /}"
+            value="${BASH_REMATCH[2]// /}"
+            
+            case "$key" in
+                "ip") 
+                    declare "${current_section}_ip=$value"
+                    ;;
+                "password") 
+                    declare "${current_section}_password=$value"
+                    ;;
+                "hostname") 
+                    declare "${current_section}_hostname=$value"
+                    ;;
+            esac
+        fi
+    done < "$config_file"
+    
+    # 验证配置
+    if [ -z "${master_ip}" ]; then
+        log_error "master节点的IP地址未配置"
+        exit 1
+    fi
+    
+    # 检查节点顺序
+    for i in {1..4}; do
+        if [ -n "${node${i}_ip}" ] && [ -z "${node$((i-1))_ip}" ] && [ $i -gt 1 ]; then
+            log_error "节点配置顺序错误: node$((i-1)) 未配置但 node$i 已配置"
+            exit 1
+        fi
+    done
+    
+    # 构建节点列表
+    nodes=("master")
+    node_ips=("$master_ip")
+    node_passwords=("$master_password")
+    node_hostnames=("$master_hostname")
+    
+    for i in {1..4}; do
+        if [ -n "${node${i}_ip}" ]; then
+            nodes+=("node$i")
+            node_ips+=("${node${i}_ip}")
+            
+            # 如果密码为空，使用master密码
+            if [ -z "${node${i}_password}" ]; then
+                node_passwords+=("$master_password")
+            else
+                node_passwords+=("${node${i}_password}")
+            fi
+            
+            # 如果主机名为空，使用默认主机名
+            if [ -z "${node${i}_hostname}" ]; then
+                node_hostnames+=("node$i")
+            else
+                node_hostnames+=("${node${i}_hostname}")
+            fi
+        fi
+    done
+    
+    # 检查节点总数
+    if [ ${#nodes[@]} -gt 5 ]; then
+        log_error "节点总数不能超过5台"
+        exit 1
+    fi
+    
+    log_info "配置文件解析完成，共发现 ${#nodes[@]} 个节点"
+    for i in "${!nodes[@]}"; do
+        log_info "  ${nodes[$i]}: ${node_ips[$i]} (${node_hostnames[$i]})"
+    done
+}
+
+# SSH基础配置
+setup_ssh() {
+    log_step "配置SSH免密登录"
+    
+    # 生成SSH密钥对（如不存在）
+    if [ ! -f ~/.ssh/id_rsa ]; then
+        ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa
+        log_info "已生成SSH密钥对"
+    else
+        log_info "SSH密钥对已存在，跳过生成"
+    fi
+    
+    # 配置所有节点免密登录
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        ip="${node_ips[$i]}"
+        password="${node_passwords[$i]}"
+        
+        log_info "配置 $node ($ip) 的SSH免密登录"
+        
+        # 使用sshpass配置免密登录
+        sshpass -p "$password" ssh-copy-id -o StrictHostKeyChecking=no root@"$ip"
+        
+        if [ $? -eq 0 ]; then
+            log_info "已配置 $node 的SSH免密登录"
+        else
+            log_error "配置 $node 的SSH免密登录失败"
+            exit 1
+        fi
+    done
+}
+
+# 设置主机名
+setup_hostnames() {
+    log_step "设置主机名"
+    
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        ip="${node_ips[$i]}"
+        hostname="${node_hostnames[$i]}"
+        
+        log_info "设置 $node ($ip) 的主机名为 $hostname"
+        
+        ssh root@"$ip" "hostnamectl set-hostname $hostname"
+        
+        if [ $? -eq 0 ]; then
+            log_info "已设置 $node 的主机名为 $hostname"
+        else
+            log_error "设置 $node 的主机名失败"
+            exit 1
+        fi
+    done
+}
+
 # 修改软件源到中国科学技术大学源
 setup_ustc_repo() {
     log_step "配置中国科学技术大学软件源"
     
-    if [ -f "/etc/yum.repos.d/Rocky-ustc.repo" ] && [ -f "/etc/yum.repos.d/epel.repo" ]; then
-        log_info "中国科学技术大学软件源及EPEL仓库已配置，跳过"
-        return
-    fi
-    
-    # 备份原始源文件
-    if [ -d "/etc/yum.repos.d" ]; then
-        cp -r /etc/yum.repos.d /etc/yum.repos.d.backup.$(date +%Y%m%d_%H%M%S)
-        log_info "已备份原始源文件到 /etc/yum.repos.d.backup.*"
-    fi
-    
-    # 禁用原有源
-    sed -i 's/enabled=1/enabled=0/g' /etc/yum.repos.d/*.repo
-    
-    # 创建中国科学技术大学源配置
-    cat > /etc/yum.repos.d/Rocky-ustc.repo << 'EOF'
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        ip="${node_ips[$i]}"
+        
+        log_info "在 $node ($ip) 上配置中国科学技术大学软件源"
+        
+        ssh root@"$ip" "
+        if [ -f "/etc/yum.repos.d/Rocky-ustc.repo" ] && [ -f "/etc/yum.repos.d/epel.repo" ]; then
+            echo '中国科学技术大学软件源及EPEL仓库已配置，跳过'
+            exit 0
+        fi
+        
+        # 备份原始源文件
+        if [ -d "/etc/yum.repos.d" ]; then
+            cp -r /etc/yum.repos.d /etc/yum.repos.d.backup.\$(date +%Y%m%d_%H%M%S)
+            echo '已备份原始源文件到 /etc/yum.repos.d.backup.*'
+        fi
+        
+        # 禁用原有源
+        sed -i 's/enabled=1/enabled=0/g' /etc/yum.repos.d/*.repo
+        
+        # 创建中国科学技术大学源配置
+        cat > /etc/yum.repos.d/Rocky-ustc.repo << 'EOF_REPO'
 [baseos]
-name=Rocky Linux $releasever - BaseOS - ustc Mirror
-baseurl=https://mirrors.ustc.edu.cn/rocky/$releasever/BaseOS/$basearch/os/
+name=Rocky Linux \$releasever - BaseOS - ustc Mirror
+baseurl=https://mirrors.ustc.edu.cn/rocky/\$releasever/BaseOS/\$basearch/os/
 gpgcheck=1
 enabled=1
 countme=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
 
 [appstream]
-name=Rocky Linux $releasever - AppStream - ustc Mirror
-baseurl=https://mirrors.ustc.edu.cn/rocky/$releasever/AppStream/$basearch/os/
+name=Rocky Linux \$releasever - AppStream - ustc Mirror
+baseurl=https://mirrors.ustc.edu.cn/rocky/\$releasever/AppStream/\$basearch/os/
 gpgcheck=1
 enabled=1
 countme=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
 
 [extras]
-name=Rocky Linux $releasever - Extras - ustc Mirror
-baseurl=https://mirrors.ustc.edu.cn/rocky/$releasever/extras/$basearch/os/
+name=Rocky Linux \$releasever - Extras - ustc Mirror
+baseurl=https://mirrors.ustc.edu.cn/rocky/\$releasever/extras/\$basearch/os/
 gpgcheck=1
 enabled=1
 countme=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
 
 [crb]
-name=Rocky Linux $releasever - CRB - ustc Mirror
-baseurl=https://mirrors.ustc.edu.cn/rocky/$releasever/CRB/$basearch/os/
+name=Rocky Linux \$releasever - CRB - ustc Mirror
+baseurl=https://mirrors.ustc.edu.cn/rocky/\$releasever/CRB/\$basearch/os/
 gpgcheck=1
 enabled=1
 countme=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
-EOF
+EOF_REPO
 
-    # 配置EPEL仓库（中国科学技术大学镜像）
-    cat > /etc/yum.repos.d/epel-ustc.repo << 'EOF'
+        # 配置EPEL仓库（中国科学技术大学镜像）
+        cat > /etc/yum.repos.d/epel-ustc.repo << 'EOF_EPEL'
 [epel]
-name=Extra Packages for Enterprise Linux $releasever - $basearch (ustc Mirror)
-baseurl=https://mirrors.ustc.edu.cn/epel/$releasever/Everything/$basearch/
+name=Extra Packages for Enterprise Linux \$releasever - \$basearch (ustc Mirror)
+baseurl=https://mirrors.ustc.edu.cn/epel/\$releasever/Everything/\$basearch/
 gpgcheck=1
 enabled=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-9
-EOF
+EOF_EPEL
 
-    # 清理缓存并更新
-    dnf clean all
-    dnf makecache
-    log_info "中国科学技术大学软件源配置完成"
-}
-
-# 主机名配置
-setup_hostname() {
-    log_step "配置主机名"
-    
-    current_hostname=$(hostname)
-    log_info "当前主机名: $current_hostname"
-    
-    echo "请选择主机类型:"
-    echo "1) 主节点 (master)"
-    echo "2) 计算节点 (slave1)"
-    echo "3) 计算节点 (slave2)"
-    echo "4) 自定义主机名"
-    
-    while true; do
-        read -p "请输入选择 (1-4): " choice
-        case $choice in
-            1)
-                new_hostname="master"
-                node_type="master"
-                # 询问是否将master也作为计算节点
-                if confirm "是否将master节点同时作为计算节点？"; then
-                    master_as_compute="yes"
-                    log_info "master节点将同时作为计算节点"
-                else
-                    master_as_compute="no"
-                    log_info "master节点仅作为控制节点"
-                fi
-                break
-                ;;
-            2)
-                new_hostname="slave1"
-                node_type="compute"
-                master_as_compute="no"
-                break
-                ;;
-            3)
-                new_hostname="slave2"
-                node_type="compute"
-                master_as_compute="no"
-                break
-                ;;
-            4)
-                read -p "请输入自定义主机名: " new_hostname
-                echo "请选择节点类型:"
-                echo "1) 主节点"
-                echo "2) 计算节点"
-                read -p "请输入选择 (1-2): " type_choice
-                case $type_choice in
-                    1) 
-                        node_type="master"
-                        if confirm "是否将master节点同时作为计算节点？"; then
-                            master_as_compute="yes"
-                            log_info "master节点将同时作为计算节点"
-                        else
-                            master_as_compute="no"
-                            log_info "master节点仅作为控制节点"
-                        fi
-                        ;;
-                    2) 
-                        node_type="compute"
-                        master_as_compute="no"
-                        ;;
-                    *) log_error "无效选择"; continue;;
-                esac
-                break
-                ;;
-            *)
-                log_error "无效选择，请重新输入"
-                ;;
-        esac
+        # 清理缓存并更新
+        dnf clean all
+        dnf makecache
+        echo '中国科学技术大学软件源配置完成'
+        "
     done
-    
-    if [[ "$current_hostname" == "$new_hostname" ]]; then
-        log_info "主机名已经是 $new_hostname，跳过修改"
-        return
-    fi
-    
-    if confirm "确认将主机名修改为: $new_hostname?"; then
-        hostnamectl set-hostname $new_hostname
-        echo "127.0.0.1 $new_hostname" >> /etc/hosts
-        log_info "主机名已修改为: $new_hostname"
-        log_info "节点类型: $node_type"
-    else
-        log_warn "跳过主机名修改"
-        node_type="master"  # 默认为master
-        master_as_compute="no"  # 默认不作为计算节点
-    fi
 }
-
 
 # 配置OpenHPC仓库
 setup_openhpc_repo() {
     log_step "配置OpenHPC仓库"
     
-    if [ -f "/etc/yum.repos.d/OpenHPC.repo" ]; then
-        log_info "OpenHPC仓库已配置，跳过"
-        return
-    fi
-    
-    # 安装OpenHPC仓库
-    dnf install -y http://repos.openhpc.community/OpenHPC/3/EL_9/x86_64/ohpc-release-3-1.el9.x86_64.rpm
-    
-    log_info "OpenHPC仓库配置完成"
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        ip="${node_ips[$i]}"
+        
+        log_info "在 $node ($ip) 上配置OpenHPC仓库"
+        
+        ssh root@"$ip" "
+        if [ -f "/etc/yum.repos.d/OpenHPC.repo" ]; then
+            echo 'OpenHPC仓库已配置，跳过'
+            exit 0
+        fi
+        
+        # 安装OpenHPC仓库
+        dnf install -y http://repos.openhpc.community/OpenHPC/3/EL_9/x86_64/ohpc-release-3-1.el9.x86_64.rpm
+        
+        echo 'OpenHPC仓库配置完成'
+        "
+    done
 }
 
 # 安装Slurm相关包
 install_slurm_packages() {
     log_step "安装Slurm相关软件包"
     
-    if [[ "$node_type" == "master" ]]; then
-        if [[ "$master_as_compute" == "yes" ]]; then
-            log_info "安装主节点+计算节点Slurm包..."
-            slurm_packages=(
-                "ohpc-slurm-server"
-                "slurm-ohpc"
-                "slurm-devel-ohpc"
-                "slurm-example-configs-ohpc"
-                "slurm-slurmctld-ohpc"
-                "slurm-slurmd-ohpc"
-                "slurm-slurmdbd-ohpc"
-                "mariadb-server"
-                "mariadb"
-            )
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        ip="${node_ips[$i]}"
+        
+        if [ "$node" == "master" ]; then
+            log_info "在 $node ($ip) 上安装主节点Slurm包..."
+            ssh root@"$ip" "
+            dnf install -y ohpc-slurm-server slurm-ohpc slurm-devel-ohpc slurm-example-configs-ohpc slurm-slurmctld-ohpc slurm-slurmdbd-ohpc mariadb-server mariadb
+            echo '主节点Slurm包安装完成'
+            "
         else
-            log_info "安装主节点Slurm包（仅控制节点）..."
-            slurm_packages=(
-                "ohpc-slurm-server"
-                "slurm-ohpc"
-                "slurm-devel-ohpc"
-                "slurm-example-configs-ohpc"
-                "slurm-slurmctld-ohpc"
-                "slurm-slurmdbd-ohpc"
-                "mariadb-server"
-                "mariadb"
-            )
-        fi
-    else
-        log_info "安装计算节点Slurm包..."
-        slurm_packages=(
-            "ohpc-slurm-client"
-            "slurm-ohpc"
-            "slurm-slurmd-ohpc"
-        )
-    fi
-    
-    for pkg in "${slurm_packages[@]}"; do
-        if dnf list installed "$pkg" &>/dev/null; then
-            log_info "$pkg 已安装，跳过"
-        else
-            dnf install -y "$pkg"
+            log_info "在 $node ($ip) 上安装计算节点Slurm包..."
+            ssh root@"$ip" "
+            dnf install -y ohpc-slurm-client slurm-ohpc slurm-slurmd-ohpc
+            echo '计算节点Slurm包安装完成'
+            "
         fi
     done
-    
-    log_info "Slurm软件包安装完成"
 }
 
 # 生成随机密码函数
@@ -306,15 +383,16 @@ EOF
 
 # 配置MariaDB (仅主节点) - 修改版
 setup_mariadb() {
-    if [[ "$node_type" != "master" ]]; then
-        return 0
-    fi
-    
     log_step "配置MariaDB数据库"
     
+    # 获取master节点IP
+    master_ip="${node_ips[0]}"
+    
     # 启动并启用MariaDB
+    ssh root@"$master_ip" "
     systemctl enable mariadb
     systemctl start mariadb
+    "
     
     # 自动生成密码
     mysql_root_pass=$(generate_random_password 20)
@@ -339,7 +417,10 @@ setup_mariadb() {
 setup_mariadb_default() {
     log_info "使用自动生成的安全配置..."
     
+    master_ip="${node_ips[0]}"
+    
     # 应用默认安全配置
+    ssh root@"$master_ip" "
     mysql -u root << EOF
 -- 设置root密码
 ALTER USER 'root'@'localhost' IDENTIFIED BY '$mysql_root_pass';
@@ -349,10 +430,11 @@ DELETE FROM mysql.user WHERE User='';
 DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
 -- 删除test数据库
 DROP DATABASE IF EXISTS test;
-DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\\\_%';
 -- 重新加载权限表
 FLUSH PRIVILEGES;
 EOF
+    "
     
     if [[ $? -eq 0 ]]; then
         log_info "MariaDB默认安全配置完成"
@@ -371,95 +453,205 @@ EOF
 create_slurm_database() {
     log_info "创建Slurm数据库和用户..."
     
+    master_ip="${node_ips[0]}"
+    
+    ssh root@"$master_ip" "
     # 检查数据库是否已存在
-    db_exists=$(mysql -u root -p"$mysql_root_pass" -e "SHOW DATABASES LIKE 'slurm_acct_db'" 2>/dev/null | grep -c "slurm_acct_db")
+    db_exists=\$(mysql -u root -p\"$mysql_root_pass\" -e \"SHOW DATABASES LIKE 'slurm_acct_db'\" 2>/dev/null | grep -c \"slurm_acct_db\")
     
     # 检查用户是否已存在
-    user_exists=$(mysql -u root -p"$mysql_root_pass" -e "SELECT User FROM mysql.user WHERE User='slurm' AND Host='localhost'" 2>/dev/null | grep -c "slurm")
+    user_exists=\$(mysql -u root -p\"$mysql_root_pass\" -e \"SELECT User FROM mysql.user WHERE User='slurm' AND Host='localhost'\" 2>/dev/null | grep -c \"slurm\")
     
-    if [ "$db_exists" -eq 0 ]; then
-        mysql -u root -p"$mysql_root_pass" -e "CREATE DATABASE slurm_acct_db;" 2>/dev/null
-        if [[ $? -eq 0 ]]; then
-            log_info "已创建slurm_acct_db数据库"
+    if [ \"\$db_exists\" -eq 0 ]; then
+        mysql -u root -p\"$mysql_root_pass\" -e \"CREATE DATABASE slurm_acct_db;\" 2>/dev/null
+        if [[ \$? -eq 0 ]]; then
+            echo '已创建slurm_acct_db数据库'
         else
-            log_error "创建数据库失败"
+            echo '创建数据库失败'
             exit 1
         fi
     else
-        log_info "slurm_acct_db数据库已存在，跳过创建"
+        echo 'slurm_acct_db数据库已存在，跳过创建'
     fi
     
-    if [ "$user_exists" -eq 0 ]; then
-        mysql -u root -p"$mysql_root_pass" -e "CREATE USER 'slurm'@'localhost' IDENTIFIED BY '$slurm_db_pass';" 2>/dev/null
-        if [[ $? -eq 0 ]]; then
-            log_info "已创建slurm用户"
+    if [ \"\$user_exists\" -eq 0 ]; then
+        mysql -u root -p\"$mysql_root_pass\" -e \"CREATE USER 'slurm'@'localhost' IDENTIFIED BY '$slurm_db_pass';\" 2>/dev/null
+        if [[ \$? -eq 0 ]]; then
+            echo '已创建slurm用户'
         else
-            log_error "创建用户失败"
+            echo '创建用户失败'
             exit 1
         fi
     else
-        log_info "slurm用户已存在，跳过创建"
+        echo 'slurm用户已存在，跳过创建'
         # 更新现有用户的密码
-        mysql -u root -p"$mysql_root_pass" -e "SET PASSWORD FOR 'slurm'@'localhost' = PASSWORD('$slurm_db_pass');" 2>/dev/null
-        log_info "已更新slurm用户密码"
+        mysql -u root -p\"$mysql_root_pass\" -e \"SET PASSWORD FOR 'slurm'@'localhost' = PASSWORD('$slurm_db_pass');\" 2>/dev/null
+        echo '已更新slurm用户密码'
     fi
     
     # 无论是否新建，都确保权限正确
-    mysql -u root -p"$mysql_root_pass" -e "GRANT ALL PRIVILEGES ON slurm_acct_db.* TO 'slurm'@'localhost';" 2>/dev/null
-    mysql -u root -p"$mysql_root_pass" -e "FLUSH PRIVILEGES;" 2>/dev/null
+    mysql -u root -p\"$mysql_root_pass\" -e \"GRANT ALL PRIVILEGES ON slurm_acct_db.* TO 'slurm'@'localhost';\" 2>/dev/null
+    mysql -u root -p\"$mysql_root_pass\" -e \"FLUSH PRIVILEGES;\" 2>/dev/null
     
-    if [[ $? -eq 0 ]]; then
-        log_info "数据库权限配置完成"
+    if [[ \$? -eq 0 ]]; then
+        echo '数据库权限配置完成'
     else
-        log_error "权限配置失败"
+        echo '权限配置失败'
         exit 1
     fi
+    "
+}
+
+# 配置Munge
+setup_munge() {
+    log_step "配置Munge认证"
+    
+    # 在所有节点安装munge
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        ip="${node_ips[$i]}"
+        
+        ssh root@"$ip" "
+        if ! dnf list installed munge &>/dev/null; then
+            dnf install -y munge munge-libs munge-devel
+            echo 'munge 已安装'
+        else
+            echo 'munge 已安装，跳过'
+        fi
+        "
+    done
+    
+    # 在master节点生成密钥
+    master_ip="${node_ips[0]}"
+    ssh root@"$master_ip" "
+    if [ ! -f /etc/munge/munge.key ]; then
+        /usr/sbin/create-munge-key -r
+        echo '已生成Munge密钥'
+    else
+        echo 'Munge密钥已存在，跳过'
+    fi
+    "
+    
+    # 将密钥分发到所有节点
+    log_info "分发Munge密钥到所有节点"
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        ip="${node_ips[$i]}"
+        
+        if [ "$node" != "master" ]; then
+            scp root@"$master_ip":/etc/munge/munge.key root@"$ip":/etc/munge/munge.key
+            ssh root@"$ip" "chown munge:munge /etc/munge/munge.key && chmod 400 /etc/munge/munge.key"
+            log_info "已将Munge密钥分发到 $node"
+        else
+            ssh root@"$ip" "chown munge:munge /etc/munge/munge.key && chmod 400 /etc/munge/munge.key"
+            log_info "已设置 $node 上的Munge密钥权限"
+        fi
+    done
+    
+    # 启动munge服务
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        ip="${node_ips[$i]}"
+        
+        ssh root@"$ip" "
+        systemctl enable munge
+        systemctl start munge
+        echo 'Munge服务已启动'
+        "
+    done
+    
+    log_info "Munge配置完成"
+}
+
+# 获取节点硬件信息
+get_node_hardware_info() {
+    log_step "获取节点硬件信息"
+    
+    # 初始化硬件信息数组
+    node_cpus=()
+    node_memory=()
+    
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        ip="${node_ips[$i]}"
+        
+        # 获取CPU核心数
+        cpu_count=$(ssh root@"$ip" "nproc")
+        
+        # 获取内存大小(MB)
+        memory_mb=$(ssh root@"$ip" "free -m | grep '^Mem:' | awk '{print \$2}'")
+        
+        node_cpus+=("$cpu_count")
+        node_memory+=("$memory_mb")
+        
+        log_info "$node: $cpu_count CPU核心, ${memory_mb}MB 内存"
+    done
 }
 
 # 配置Slurm
 configure_slurm() {
     log_step "配置Slurm"
     
-    # 创建Slurm用户
-    if ! id slurm &>/dev/null; then
-        useradd -r -s /bin/false -d /var/lib/slurm slurm
-        log_info "已创建slurm用户"
-    else
-        log_info "slurm用户已存在，跳过"
-    fi
+    # 获取硬件信息
+    get_node_hardware_info
     
-    # 创建必要目录
-    mkdir -p /var/spool/slurm/ctld
-    mkdir -p /var/spool/slurm/d
-    mkdir -p /var/log/slurm
+    # 在所有节点创建Slurm用户和目录
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        ip="${node_ips[$i]}"
+        
+        ssh root@"$ip" "
+        # 创建Slurm用户
+        if ! id slurm &>/dev/null; then
+            useradd -r -s /bin/false -d /var/lib/slurm slurm
+            echo '已创建slurm用户'
+        else
+            echo 'slurm用户已存在，跳过'
+        fi
+        
+        # 创建必要目录
+        mkdir -p /var/spool/slurm/ctld
+        mkdir -p /var/spool/slurm/d
+        mkdir -p /var/log/slurm
+        
+        chown slurm:slurm /var/spool/slurm/ctld
+        chown slurm:slurm /var/spool/slurm/d
+        chown slurm:slurm /var/log/slurm
+        "
+    done
     
-    chown slurm:slurm /var/spool/slurm/ctld
-    chown slurm:slurm /var/spool/slurm/d
-    chown slurm:slurm /var/log/slurm
+    # 在master节点生成配置文件
+    master_ip="${node_ips[0]}"
+    master_hostname="${node_hostnames[0]}"
     
-    if [[ "$node_type" == "master" ]]; then
-        # 主节点配置
-        configure_master_slurm
-    else
-        # 计算节点配置
-        configure_compute_slurm
-    fi
-}
-
-# 配置主节点Slurm
-configure_master_slurm() {
-    log_info "配置主节点Slurm..."
+    # 构建节点配置部分
+    node_configs=""
+    partition_nodes=""
     
-    # 根据master是否作为计算节点生成不同的配置
-    if [[ "$master_as_compute" == "yes" ]]; then
-        # master作为计算节点的配置
-        cat > /etc/slurm/slurm.conf << 'EOF'
-# slurm.conf file generated by configurator.html.
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        hostname="${node_hostnames[$i]}"
+        cpus="${node_cpus[$i]}"
+        memory="${node_memory[$i]}"
+        
+        # 保留90%的内存给Slurm使用
+        slurm_memory=$((memory * 90 / 100))
+        
+        node_configs+="NodeName=$hostname CPUs=$cpus RealMemory=$slurm_memory State=UNKNOWN\n"
+        if [ -n "$partition_nodes" ]; then
+            partition_nodes+=",$hostname"
+        else
+            partition_nodes="$hostname"
+        fi
+    done
+    
+    # 生成slurm.conf
+    ssh root@"$master_ip" "
+    cat > /etc/slurm/slurm.conf << 'EOF'
+# slurm.conf file generated by automated script
 ClusterName=cluster
-ControlMachine=master
-ControlAddr=master
-#BackupController=
-#BackupAddr=
+ControlMachine=$master_hostname
+ControlAddr=$master_hostname
 
 SlurmUser=slurm
 SlurmdUser=root
@@ -499,68 +691,15 @@ SlurmdDebug=info
 SlurmdLogFile=/var/log/slurm/slurmd.log
 
 # NODES
-NodeName=master CPUs=4 Sockets=1 CoresPerSocket=4 ThreadsPerCore=1 RealMemory=4000 State=UNKNOWN
-NodeName=slave[1-2] CPUs=4 Sockets=1 CoresPerSocket=4 ThreadsPerCore=1 RealMemory=4000 State=UNKNOWN
+$(echo -e "$node_configs")
 
 # PARTITIONS
-PartitionName=compute Nodes=master,slave[1-2] Default=YES MaxTime=INFINITE State=UP
+PartitionName=compute Nodes=$partition_nodes Default=YES MaxTime=INFINITE State=UP
 EOF
-    else
-        # master仅作为控制节点的配置
-        cat > /etc/slurm/slurm.conf << 'EOF'
-# slurm.conf file generated by configurator.html.
-ClusterName=cluster
-ControlMachine=master
-ControlAddr=master
-#BackupController=
-#BackupAddr=
-
-SlurmUser=slurm
-SlurmdUser=root
-SlurmctldPort=6817
-SlurmdPort=6818
-AuthType=auth/munge
-StateSaveLocation=/var/spool/slurm/ctld
-SlurmdSpoolDir=/var/spool/slurm/d
-SwitchType=switch/none
-MpiDefault=none
-SlurmctldPidFile=/var/run/slurm/slurmctld.pid
-SlurmdPidFile=/var/run/slurm/slurmd.pid
-ProctrackType=proctrack/pgid
-ReturnToService=1
-SlurmctldTimeout=120
-SlurmdTimeout=300
-InactiveLimit=0
-MinJobAge=300
-KillWait=30
-MaxJobCount=10000
-Waittime=0
-
-# SCHEDULING
-SchedulerType=sched/backfill
-SelectType=select/cons_tres
-SelectTypeParameters=CR_Core
-
-# LOGGING AND ACCOUNTING
-AccountingStorageType=accounting_storage/slurmdbd
-AccountingStoreFlags=job_comment
-JobCompType=jobcomp/none
-JobAcctGatherFrequency=30
-JobAcctGatherType=jobacct_gather/linux
-SlurmctldDebug=info
-SlurmctldLogFile=/var/log/slurm/slurmctld.log
-SlurmdDebug=info
-SlurmdLogFile=/var/log/slurm/slurmd.log
-
-# NODES
-NodeName=slave[1-2] CPUs=4 Sockets=1 CoresPerSocket=4 ThreadsPerCore=1 RealMemory=4000 State=UNKNOWN
-
-# PARTITIONS
-PartitionName=compute Nodes=slave[1-2] Default=YES MaxTime=INFINITE State=UP
-EOF
-    fi
-
-    # 配置slurmdbd
+    "
+    
+    # 生成slurmdbd.conf
+    ssh root@"$master_ip" "
     cat > /etc/slurm/slurmdbd.conf << EOF
 AuthType=auth/munge
 AuthInfo=/var/run/munge/munge.socket.2
@@ -576,230 +715,89 @@ StoragePass=$slurm_db_pass
 StorageUser=slurm
 StorageLoc=slurm_acct_db
 EOF
-
+    
     chmod 600 /etc/slurm/slurmdbd.conf
     chown slurm:slurm /etc/slurm/slurmdbd.conf
+    "
     
-    log_info "主节点Slurm配置完成"
-}
-
-# 配置计算节点Slurm
-configure_compute_slurm() {
-    log_info "配置计算节点Slurm..."
-    
-    log_warn "计算节点需要从主节点复制配置文件"
-    echo "请在主节点配置完成后，手动复制以下文件到此节点:"
-    echo "  - /etc/slurm/slurm.conf"
-    echo "  - /etc/munge/munge.key"
-    
-    read -p "按回车键继续..."
-}
-
-# 配置Munge
-setup_munge() {
-    log_step "配置Munge认证"
-    
-    # 安装munge
-    if ! dnf list installed munge &>/dev/null; then
-        dnf install -y munge munge-libs munge-devel
-    else
-        log_info "munge 已安装，跳过"
-    fi
-    
-    if [[ "$node_type" == "master" ]]; then
-        # 主节点生成密钥
-        if [ ! -f /etc/munge/munge.key ]; then
-            /usr/sbin/create-munge-key -r
-            log_info "已生成Munge密钥"
-        else
-            log_info "Munge密钥已存在，跳过"
-        fi
+    # 将配置文件分发到所有计算节点
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        ip="${node_ips[$i]}"
+        hostname="${node_hostnames[$i]}"
         
-        log_warn "请将 /etc/munge/munge.key 复制到所有计算节点的相同位置"
-    else
-        log_warn "请从主节点复制 /etc/munge/munge.key 到 /etc/munge/munge.key"
-        read -p "复制完成后按回车键继续..."
-    fi
+        if [ "$node" != "master" ]; then
+            scp root@"$master_ip":/etc/slurm/slurm.conf root@"$ip":/etc/slurm/slurm.conf
+            log_info "已将slurm.conf分发到 $node"
+        fi
+    done
     
-    # 设置权限
-    chown munge:munge /etc/munge/munge.key
-    chmod 400 /etc/munge/munge.key
-    
-    # 启动munge服务
-    systemctl enable munge
-    systemctl start munge
-    
-    log_info "Munge配置完成"
+    log_info "Slurm配置完成"
 }
 
 # 启动Slurm服务
 start_slurm_services() {
     log_step "启动Slurm服务"
     
-    if [[ "$node_type" == "master" ]]; then
-        # 主节点服务
-        systemctl enable slurmdbd
-        systemctl enable slurmctld
+    # 在master节点启动服务
+    master_ip="${node_ips[0]}"
+    ssh root@"$master_ip" "
+    systemctl enable slurmdbd
+    systemctl enable slurmctld
+    
+    systemctl start slurmdbd
+    sleep 5
+    systemctl start slurmctld
+    
+    echo '主节点Slurm服务已启动'
+    "
+    
+    # 在所有节点启动slurmd服务
+    for i in "${!nodes[@]}"; do
+        node="${nodes[$i]}"
+        ip="${node_ips[$i]}"
         
-        systemctl start slurmdbd
-        sleep 5
-        systemctl start slurmctld
-        
-        # 根据配置决定是否启动slurmd
-        if [[ "$master_as_compute" == "yes" ]]; then
-            systemctl enable slurmd
-            systemctl start slurmd
-            log_info "主节点Slurm服务已启动（包含计算服务）"
-        else
-            log_info "主节点Slurm控制服务已启动"
-        fi
-    else
-        # 计算节点服务
+        ssh root@"$ip" "
         systemctl enable slurmd
         systemctl start slurmd
-        
-        log_info "计算节点Slurm服务已启动"
-    fi
-}
-
-# 配置防火墙
-setup_firewall() {
-    log_step "配置防火墙"
+        echo '$node 节点Slurm服务已启动'
+        "
+    done
     
-    if confirm "是否配置防火墙规则?"; then
-        # 启动firewalld
-        systemctl enable firewalld
-        systemctl start firewalld
-        
-        # Slurm端口
-        firewall-cmd --permanent --add-port=6817/tcp  # slurmctld
-        firewall-cmd --permanent --add-port=6818/tcp  # slurmd
-        firewall-cmd --permanent --add-port=6819/tcp  # slurmdbd
-        
-        # SSH端口
-        firewall-cmd --permanent --add-service=ssh
-        
-        # Munge端口
-        firewall-cmd --permanent --add-port=6866/tcp
-        
-        firewall-cmd --reload
-        
-        log_info "防火墙规则配置完成"
-    else
-        log_warn "跳过防火墙配置"
-    fi
-}
-
-# 系统优化
-system_optimization() {
-    log_step "系统优化"
-    
-    # 时间同步
-    systemctl enable chronyd
-    systemctl start chronyd
-    
-    # 配置系统日志
-    systemctl enable rsyslog
-    systemctl start rsyslog
-    
-    # 设置系统限制
-    if ! grep -q "Slurm limits" /etc/security/limits.conf; then
-        cat >> /etc/security/limits.conf << 'EOF'
-# Slurm limits
-* soft nofile 65536
-* hard nofile 65536
-* soft nproc 65536
-* hard nproc 65536
-EOF
-        log_info "系统限制已设置"
-    else
-        log_info "系统限制已配置，跳过"
-    fi
-    
-    log_info "系统优化完成"
+    log_info "所有Slurm服务已启动"
 }
 
 # 验证安装
 verify_installation() {
     log_step "验证安装"
     
-    # 检查服务状态
-    echo "=== 服务状态 ==="
-    systemctl status munge --no-pager -l
+    master_ip="${node_ips[0]}"
     
-    if [[ "$node_type" == "master" ]]; then
-        systemctl status slurmdbd --no-pager -l
-        systemctl status slurmctld --no-pager -l
-        
-        if [[ "$master_as_compute" == "yes" ]]; then
-            systemctl status slurmd --no-pager -l
-        fi
-    else
-        systemctl status slurmd --no-pager -l
-    fi
+    ssh root@"$master_ip" "
+    echo '=== 等待服务启动 ==='
+    sleep 10
     
-    # 检查Slurm命令
-    echo -e "\n=== Slurm版本 ==="
-    sinfo --version || log_warn "sinfo命令不可用"
+    echo '=== 集群状态检查 ==='
+    sinfo -o '%n %t %C %m' || echo '无法获取集群信息'
     
-    if [[ "$node_type" == "master" ]]; then
-        echo -e "\n=== 集群信息 ==="
-        sinfo || log_warn "无法获取集群信息，可能需要完成所有节点配置"
-        
-        echo -e "\n=== 节点信息 ==="
-        scontrol show nodes || log_warn "无法获取节点信息"
-    fi
+    echo '=== 测试作业提交 ==='
+    echo '#!/bin/bash' > test_job.sh
+    echo '#SBATCH --job-name=test' >> test_job.sh
+    echo '#SBATCH --output=test.out' >> test_job.sh
+    echo '#SBATCH --error=test.err' >> test_job.sh
+    echo '#SBATCH --ntasks=1' >> test_job.sh
+    echo 'srun hostname' >> test_job.sh
+    
+    sbatch test_job.sh || echo '作业提交失败'
+    
+    echo '=== 作业队列状态 ==='
+    squeue || echo '无法获取作业队列状态'
+    
+    echo '=== 节点详情 ==='
+    scontrol show nodes || echo '无法获取节点详情'
+    "
     
     log_info "安装验证完成"
-}
-
-# 显示后续配置提示
-show_post_install_info() {
-    log_step "后续配置提示"
-    
-    echo -e "\n${GREEN}=== Slurm 24.11.5 安装完成 ===${NC}"
-    echo
-    
-    if [[ "$node_type" == "master" ]]; then
-        echo "主节点后续操作:"
-        echo "1. 将 /etc/munge/munge.key 复制到所有计算节点"
-        echo "2. 将 /etc/slurm/slurm.conf 复制到所有计算节点"
-        echo "3. 根据实际硬件配置修改 /etc/slurm/slurm.conf 中的节点信息"
-        echo "4. 确保所有节点的主机名解析正确 (/etc/hosts)"
-        if [[ "$master_as_compute" == "yes" ]]; then
-            echo "5. 在所有节点安装完成后运行: scontrol update nodename=ALL state=idle"
-            echo "   注意：master节点已配置为计算节点"
-        else
-            echo "5. 在所有节点安装完成后运行: scontrol update nodename=slave[1-2] state=idle"
-            echo "   注意：master节点仅作为控制节点，不参与计算"
-        fi
-    else
-        echo "计算节点后续操作:"
-        echo "1. 从主节点复制 /etc/munge/munge.key"
-        echo "2. 从主节点复制 /etc/slurm/slurm.conf"
-        echo "3. 确保主机名解析正确 (/etc/hosts)"
-        echo "4. 重启munge和slurmd服务"
-    fi
-    
-    echo
-    echo "常用命令:"
-    echo "  sinfo          - 查看集群信息"
-    echo "  squeue         - 查看作业队列"
-    echo "  sbatch script  - 提交作业脚本"
-    echo "  scancel jobid  - 取消作业"
-    echo "  scontrol show nodes - 查看节点详情"
-    
-    echo
-    echo "配置文件位置:"
-    echo "  /etc/slurm/slurm.conf     - Slurm主配置文件"
-    echo "  /etc/slurm/slurmdbd.conf  - 数据库配置文件"
-    echo "  /etc/munge/munge.key      - Munge认证密钥"
-    
-    echo
-    echo "日志文件位置:"
-    echo "  /var/log/slurm/slurmctld.log - 控制节点日志"
-    echo "  /var/log/slurm/slurmd.log    - 计算节点日志"
-    echo "  /var/log/slurm/slurmdbd.log  - 数据库日志"
 }
 
 show_logo(){
@@ -830,30 +828,20 @@ main() {
         exit 0
     fi
     
-    # 初始化变量
-    master_as_compute="no"
+    # 解析配置文件
+    parse_config
     
     # 执行安装步骤
+    setup_ssh
+    setup_hostnames
     setup_ustc_repo
-    setup_hostname
     setup_openhpc_repo
     install_slurm_packages
     setup_munge
-    
-    if [[ "$node_type" == "master" ]]; then
-        setup_mariadb
-    fi
-    
+    setup_mariadb
     configure_slurm
-    setup_firewall
-    system_optimization
     start_slurm_services
-    
-    # 等待服务启动
-    sleep 10
-    
     verify_installation
-    show_post_install_info
     
     log_info "Slurm 24.11.5 部署完成!"
 }
