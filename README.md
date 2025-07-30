@@ -9,7 +9,7 @@
 
 <p align="left">
   <a href="https://www.gnu.org/licenses/gpl-3.0.html"><img src="https://shields.io/github/license/1Panel-dev/1Panel?color=%231890FF" alt="License: GPL v3"></a>
-  <a href="https://github.com/zeisscai/SGHPC-tools"><img src="https://img.shields.io/badge/Version-1.3_beta-blue" alt="GitHub release"></a>
+  <a href="https://github.com/zeisscai/SGHPC-tools"><img src="https://img.shields.io/badge/Version-1.4_beta-blue" alt="GitHub release"></a>
   <a href="https://docs.sg-hpc.com"><img src="https://img.shields.io/badge/%E4%BD%BF%E7%94%A8%E6%8C%87%E5%8D%97-8A2BE2" alt="SG-HPC docs"></a>
 </p>
 
@@ -27,17 +27,39 @@ SG-HPC Tool 是一个专为高性能计算（HPC）领域设计的集群管理�
 
 ## slurm集群部署快速使用
 
+配置 deploy.conf 文件，并修改成自己的配置，目前脚本最多5台节点，默认使用root账户:
+
+```shell
+[master]
+ip = 192.168.11.201
+password = password
+hostname = master
+
+[node1]
+ip = 192.168.11.150
+password = password
+hostname = node1
+
+[node2]
+ip = 192.168.11.204
+password = password
+hostname = node2
+
+```
+
+
 在 root 用户或者 sudo 下使用：
 ```shell
     dnf install -y wget
-    wget https://github.com/zeisscai/SGHPC-tools/raw/refs/heads/main/slurm/slurm_install-Rocky-9.6-x86_64-minimal-1.2.sh
-    chmod a+x slurm_install-Rocky-9.6-x86_64-minimal-1.2.sh
-    # sudo
-    sudo ./slurm_install-Rocky-9.6-x86_64-minimal-1.2.sh
+    wget https://github.com/zeisscai/SGHPC-tools/raw/refs/heads/main/slurm/slurm_install-Rocky-9.6-1.4sh
+
+    chmod a+x slurm_install-Rocky-9.6-1.2.sh
     # root
-    sh slurm_install-Rocky-9.6-x86_64-minimal-1.2.sh
+    sh slurm_install-Rocky-9.6-1.2.sh
 ```
-安装完成后需要自行复制munge.key，修改slurm.conf，修改hosts文件。
+
+在安装过程中，更换ustc软件源为可选，如果已经更换过，注意不要再次更换以免报错。如果脚本在一次运行无法完成，最好的办法是重新安装 Rocky Linux 9.6 系统后再运行脚本。
+
 
 ## 联系我们
 如果有问题或建议，可发送邮件至
