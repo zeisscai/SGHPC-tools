@@ -1176,17 +1176,20 @@ main() {
     parse_config
     
     # 询问是否清理之前的安装
-    if confirm "是否清理之前的安装残留? (推荐用于重复安装)"; then
+    if confirm "是否清理之前的安装残留?"; then
         cleanup_previous_install
     fi
     
     # 询问是否配置USTC软件源
-    if confirm "是否配置USTC软件源? (推荐用于国内网络环境)"; then
+    if confirm "是否配置USTC软件源?"; then
         setup_ustc_repo
     else
         log_info "跳过USTC软件源配置"
     fi
     
+    setup_hostnames
+
+    setup_ssh
     # 配置OpenHPC仓库
     setup_openhpc_repo
     
