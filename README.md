@@ -51,11 +51,11 @@ hostname = node2
 在 root 用户或者 sudo 下使用：
 ```shell
     dnf install -y wget
-    wget https://github.com/zeisscai/SGHPC-tools/raw/refs/heads/main/slurm/slurm_install-Rocky-9.6-1.4sh
+    wget https://github.com/zeisscai/SGHPC-tools/raw/refs/heads/main/slurm/slurm_install-Rocky9.6-1.4.sh
 
-    chmod a+x slurm_install-Rocky-9.6-1.2.sh
+    chmod a+x slurm_install-Rocky9.6-1.4.sh
     # root
-    sh slurm_install-Rocky-9.6-1.2.sh
+    sh slurm_install-Rocky9.6-1.4.sh
 ```
 
 在安装过程中，更换ustc软件源为可选，如果已经更换过，注意不要再次更换以免报错。如果脚本在一次运行无法完成，最好的办法是重新安装 Rocky Linux 9.6 系统后再运行脚本。
